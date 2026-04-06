@@ -1,0 +1,289 @@
+import aiohttp
+import asyncio
+import random
+import re
+import threading
+from flask import Flask, request, jsonify, render_template_string
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
+# ================= CONFIG =================
+report = {
+    "dirs": [],
+    "params": [],
+    "js_apis": [],
+    "discovered_api": [],
+    "headers": {},
+    "manual": [],
+    "fixes": []
+}
+
+visited = set()
+USER_AGENTS = ["Mozilla/5.0", "Chrome/120", "Safari"]
+
+# ================= SCANNER =================
+async def check_headers(session, url):
+    async with session.get(url) as r:
+        for h in ["Server", "X-Frame-Options", "Content-Security-Policy"]:
+            report["headers"][h] = r.headers.get(h, "MISSING")
+
+async def crawl(session, url, base):
+    if url in visited:
+        return
+    visited.add(url)
+    try:
+        async with session.get(url) as r:
+            html = await r.text()
+            report["dirs"].append(url)
+            soup = BeautifulSoup(html, "html.parser")
+
+            for s in soup.find_all("script", src=True):
+                js = urljoin(base, s["src"])
+                await js_parser(session, js)
+
+            for a in soup.find_all("a", href=True):
+                full = urljoin(base, a["href"])
+                if base in full:
+                    await crawl(session, full, base)
+    except:
+        pass
+
+async def js_parser(session, js):
+    try:
+        async with session.get(js) as r:
+            text = await r.text()
+            for m in re.findall(r'(fetch|axios)\(["\'](.*?)["\']', text):
+                report["js_apis"].append(m[1])
+    except:
+        pass
+
+async def param_fuzz(session, url):
+    payloads = ["1", "' OR '1'='1", "<script>alert(1)</script>"]
+    for p in payloads:
+        try:
+            async with session.get(f"{url}?id={p}") as r:
+                t = await r.text()
+                if "error" in t.lower():
+                    report["params"].append({"type": "SQLi", "url": url})
+                if "<script>alert(1)</script>" in t:
+                    report["params"].append({"type": "XSS", "url": url})
+        except:
+            pass
+
+# ================= MANUAL PROXY =================
+app = Flask(__name__)
+
+@app.route("/manual", methods=["GET", "POST"])
+def manual():
+    if request.method == "POST":
+        url_form = request.form["url"]
+        method = request.form["method"]
+        params = request.form.get("params", "")
+
+        payload = dict([p.split("=") for p in params.split("&") if "=" in p])
+
+        async def send_request():
+            async with aiohttp.ClientSession() as s:
+                try:
+                    if method.upper() == "GET":
+                        async with s.get(url_form, params=payload) as r:
+                            text = await r.text()
+                    else:
+                        async with s.post(url_form, data=payload) as r:
+                            text = await r.text()
+                    report["manual"].append({
+                        "url": url_form,
+                        "method": method,
+                        "params": payload,
+                        "response": text[:1000]
+                    })
+                except:
+                    report["manual"].append({
+                        "url": url_form,
+                        "method": method,
+                        "params": payload,
+                        "response": "Request failed"
+                    })
+
+        asyncio.run(send_request())
+        return jsonify({"status": "sent"})
+
+    return jsonify(report["manual"])
+
+# ================= SAFE LOGIN + HEADERS =================
+async def safe_login_test(session, login_url):
+    try:
+        async with session.get(login_url) as r:
+            html = await r.text()
+            if "csrf" not in html.lower():
+                report["params"].append({"type": "CSRF", "url": login_url})
+    except:
+        pass
+
+async def security_headers_test(session, url):
+    async with session.get(url) as r:
+        headers = r.headers
+        for h in ["Strict-Transport-Security", "Content-Security-Policy",
+                  "X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy"]:
+            if headers.get(h) is None:
+                report["params"].append({"type": "Header Missing", "header": h, "url": url})
+            report["headers"][h] = headers.get(h, "MISSING")
+
+# ================= AI FIX + CVSS =================
+def ai_fix_advice(report):
+    fixes = []
+    for v in report.get("params", []):
+        if v["type"] == "SQLi":
+            fixes.append({"type": "SQLi", "fix": "Use prepared statements / parameterized queries."})
+        elif v["type"] == "XSS":
+            fixes.append({"type": "XSS", "fix": "Escape output, use CSP headers, validate input."})
+        elif v["type"] == "IDOR":
+            fixes.append({"type": "IDOR", "fix": "Implement proper access control checks."})
+        elif v["type"] == "CSRF":
+            fixes.append({"type": "CSRF", "fix": "Add CSRF tokens for forms."})
+        elif v.get("type") == "Header Missing":
+            fixes.append({"type": "Header Missing", "fix": f"Add missing header {v.get('header')}"})
+    report["fixes"] = fixes
+
+def assign_cvss(report):
+    for v in report.get("params", []):
+        if v["type"] == "SQLi": v["cvss"] = 9.0
+        elif v["type"] == "XSS": v["cvss"] = 6.1
+        elif v["type"] == "IDOR": v["cvss"] = 7.5
+        elif v["type"] == "CSRF": v["cvss"] = 5.0
+        elif v.get("type") == "Header Missing": v["cvss"] = 4.0
+
+def prioritize_vulns(report):
+    report["params"].sort(key=lambda x: x.get("cvss", 0), reverse=True)
+
+# ================= PDF REPORT =================
+def generate_pdf(report, filename="pentest_report.pdf"):
+    c = canvas.Canvas(filename, pagesize=letter)
+    width, height = letter
+    c.setFont("Helvetica", 12)
+    y = height - 50
+    c.drawString(50, y, "Pentest PRO+ Report")
+    y -= 30
+    for v in report.get("params", []):
+        fix_text = next((f['fix'] for f in report.get('fixes', []) if f['type'] == v['type']), "-")
+        line = f"{v['type']} | URL: {v.get('url', '-')[:60]} | CVSS: {v.get('cvss','-')} | Fix: {fix_text}"
+        c.drawString(50, y, line)
+        y -= 20
+        if y < 50:
+            c.showPage()
+            y = height - 50
+    c.save()
+
+# ================= MAIN SCAN =================
+async def main_scan(url):
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    async with aiohttp.ClientSession(headers=headers) as s:
+        await check_headers(s, url)
+        await crawl(s, url, url)
+        await param_fuzz(s, url)
+        await safe_login_test(s, url + "/login")
+        await security_headers_test(s, url)
+    ai_fix_advice(report)
+    assign_cvss(report)
+    prioritize_vulns(report)
+    generate_pdf(report)
+
+def run_scan(url):
+    asyncio.run(main_scan(url))
+
+# ================= UI =================
+HTML_UI = """
+<html>
+<head>
+<title>Pentest PRO+</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{background:#111;color:#eee;font-family:Arial}
+button{margin:5px;padding:10px}
+.tab{display:none}
+.tab.active{display:block}
+</style>
+</head>
+<body>
+<h1>Pentest PRO+ Dashboard</h1>
+<div>
+<input type="text" id="scan_url" size="50" placeholder="https://example.com">
+<button onclick="startScan()">Start Scan</button>
+<button onclick="load()">Refresh</button>
+</div>
+<div>
+<button onclick="tab('dirs')">Dirs</button>
+<button onclick="tab('vulns')">Vulns</button>
+<button onclick="tab('manual')">Manual</button>
+</div>
+<div id="dirs" class="tab"></div>
+<div id="vulns" class="tab"></div>
+<div id="manual" class="tab">
+<h2>Manual Test</h2>
+URL <input id="url" size="40"><br>
+<select id="method"><option>GET</option><option>POST</option></select><br>
+Params <input id="params"><br>
+<button onclick="send()">Send</button>
+<pre id="manualResp"></pre>
+</div>
+<canvas id="chart"></canvas>
+<script>
+function tab(t){
+ document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'))
+ document.getElementById(t).classList.add('active')
+}
+function startScan(){
+ let url = document.getElementById('scan_url').value;
+ if(!url) { alert("Введите URL"); return; }
+ fetch('/start?url=' + encodeURIComponent(url))
+}
+function load(){
+ fetch('/report').then(r=>r.json()).then(d=>{
+  dirs.innerText=JSON.stringify(d.dirs,null,2)
+  vulns.innerText=JSON.stringify(d.params,null,2)
+  let types={}
+  d.params.forEach(v=>types[v.type]=(types[v.type]||0)+1)
+  new Chart(document.getElementById('chart'),{
+    type:'bar',
+    data:{labels:Object.keys(types),datasets:[{label:"Vuln types",data:Object.values(types)}]}
+  })
+})
+}
+function send(){
+ let data=new URLSearchParams()
+ data.append("url",url.value)
+ data.append("method",method.value)
+ data.append("params",params.value)
+ fetch('/manual',{method:'POST',body:data})
+}
+setInterval(()=>{
+ fetch('/manual').then(r=>r.json()).then(d=>{
+  manualResp.innerText=JSON.stringify(d,null,2)
+ })
+},3000)
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def ui():
+    return render_template_string(HTML_UI)
+
+@app.route("/start")
+def start():
+    url = request.args.get("url")
+    if not url:
+        return "URL не указан", 400
+    threading.Thread(target=run_scan, args=(url,)).start()
+    return f"Scan started for {url}"
+
+@app.route("/report")
+def get_report():
+    return jsonify(report)
+
+# ================= RUN =================
+if __name__ == "__main__":
+    app.run(port=5000)
