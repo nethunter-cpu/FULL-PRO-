@@ -9,21 +9,25 @@ from urllib.parse import urljoin
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
-# ================= CONFIG =================
-report = {
-    "dirs": [],
-    "params": [],
-    "js_apis": [],
-    "discovered_api": [],
-    "headers": {},
-    "manual": [],
-    "fixes": []
-}
-
+# ================= GLOBAL VARIABLES =================
 visited = set()
+report = {}
+
+def reset_report():
+    global report
+    report = {
+        "dirs": [],
+        "params": [],
+        "js_apis": [],
+        "discovered_api": [],
+        "headers": {},
+        "manual": [],
+        "fixes": []
+    }
+
 USER_AGENTS = ["Mozilla/5.0", "Chrome/120", "Safari"]
 
-# ================= SCANNER =================
+# ================= SCANNER FUNCTIONS =================
 async def check_headers(session, url):
     async with session.get(url) as r:
         for h in ["Server", "X-Frame-Options", "Content-Security-Policy"]:
@@ -72,47 +76,6 @@ async def param_fuzz(session, url):
         except:
             pass
 
-# ================= MANUAL PROXY =================
-app = Flask(__name__)
-
-@app.route("/manual", methods=["GET", "POST"])
-def manual():
-    if request.method == "POST":
-        url_form = request.form["url"]
-        method = request.form["method"]
-        params = request.form.get("params", "")
-
-        payload = dict([p.split("=") for p in params.split("&") if "=" in p])
-
-        async def send_request():
-            async with aiohttp.ClientSession() as s:
-                try:
-                    if method.upper() == "GET":
-                        async with s.get(url_form, params=payload) as r:
-                            text = await r.text()
-                    else:
-                        async with s.post(url_form, data=payload) as r:
-                            text = await r.text()
-                    report["manual"].append({
-                        "url": url_form,
-                        "method": method,
-                        "params": payload,
-                        "response": text[:1000]
-                    })
-                except:
-                    report["manual"].append({
-                        "url": url_form,
-                        "method": method,
-                        "params": payload,
-                        "response": "Request failed"
-                    })
-
-        asyncio.run(send_request())
-        return jsonify({"status": "sent"})
-
-    return jsonify(report["manual"])
-
-# ================= SAFE LOGIN + HEADERS =================
 async def safe_login_test(session, login_url):
     try:
         async with session.get(login_url) as r:
@@ -160,6 +123,9 @@ def prioritize_vulns(report):
 
 # ================= PDF REPORT =================
 def generate_pdf(report, filename="pentest_report.pdf"):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
     c = canvas.Canvas(filename, pagesize=letter)
     width, height = letter
     c.setFont("Helvetica", 12)
@@ -193,7 +159,42 @@ async def main_scan(url):
 def run_scan(url):
     asyncio.run(main_scan(url))
 
-# ================= UI =================
+# ================= FLASK APP =================
+app = Flask(__name__)
+
+@app.route("/manual", methods=["GET", "POST"])
+def manual():
+    if request.method == "POST":
+        url_form = request.form["url"]
+        method = request.form["method"]
+        params = request.form.get("params", "")
+        payload = dict([p.split("=") for p in params.split("&") if "=" in p])
+        async def send_request():
+            async with aiohttp.ClientSession() as s:
+                try:
+                    if method.upper() == "GET":
+                        async with s.get(url_form, params=payload) as r:
+                            text = await r.text()
+                    else:
+                        async with s.post(url_form, data=payload) as r:
+                            text = await r.text()
+                    report["manual"].append({
+                        "url": url_form,
+                        "method": method,
+                        "params": payload,
+                        "response": text[:1000]
+                    })
+                except:
+                    report["manual"].append({
+                        "url": url_form,
+                        "method": method,
+                        "params": payload,
+                        "response": "Request failed"
+                    })
+        asyncio.run(send_request())
+        return jsonify({"status": "sent"})
+    return jsonify(report.get("manual", []))
+
 HTML_UI = """
 <html>
 <head>
@@ -277,6 +278,11 @@ def start():
     url = request.args.get("url")
     if not url:
         return "URL не указан", 400
+
+    global visited
+    visited = set()
+    reset_report()
+
     threading.Thread(target=run_scan, args=(url,)).start()
     return f"Scan started for {url}"
 
